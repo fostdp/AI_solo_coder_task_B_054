@@ -3,6 +3,10 @@ use crate::models::*;
 use crate::nbiot_ingest::NbiotIngestService;
 use crate::moisture_diffusion::MoistureDiffusionService;
 use crate::peg_penetration::PegPenetrationService;
+use crate::dehydration_stress::DehydrationStressSolver;
+use crate::convection_diffusion::ConvectionDiffusionSolver;
+use crate::gpr_prediction::GaussianProcessRegressor;
+use crate::dimensional_stability::DimensionalStabilitySimulator;
 use crate::metrics::Metrics;
 use actix_web::{web, HttpResponse, Responder};
 use chrono::{DateTime, Utc, Duration};
@@ -752,4 +756,253 @@ pub async fn get_metrics() -> impl Responder {
         Err(e) => HttpResponse::InternalServerError()
             .body(format!("Failed to encode metrics: {}", e)),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StressCalculationRequest {
+    pub initial_moisture: f64,
+    pub target_moisture: f64,
+    pub time_hours: f64,
+    pub diffusion_coefficient: Option<f64>,
+    pub young_modulus: Option<f64>,
+    pub shrinkage_coefficient: Option<f64>,
+    pub tensile_strength: Option<f64>,
+    pub num_elements_x: Option<usize>,
+    pub num_elements_y: Option<usize>,
+}
+
+pub async fn compute_dehydration_stress(
+    _solver: web::Data<DehydrationStressSolver>,
+    body: web::Json<StressCalculationRequest>,
+) -> impl Responder {
+    let mut config = crate::dehydration_stress::StressConfig::default();
+
+    if let Some(e) = body.young_modulus {
+        config.young_modulus = e;
+    }
+    if let Some(s) = body.shrinkage_coefficient {
+        config.shrinkage_coefficient = s;
+    }
+    if let Some(t) = body.tensile_strength {
+        config.tensile_strength = t;
+    }
+    if let Some(nx) = body.num_elements_x {
+        config.num_elements_x = nx;
+    }
+    if let Some(ny) = body.num_elements_y {
+        config.num_elements_y = ny;
+    }
+
+    let d = body.diffusion_coefficient.unwrap_or(1e-9);
+
+    let solver = crate::dehydration_stress::DehydrationStressSolver::new(config);
+
+    let moisture_profile = solver.generate_moisture_profile(
+        body.initial_moisture,
+        body.target_moisture,
+        body.time_hours,
+        d,
+    );
+
+    let result = solver.compute_stress_field(&moisture_profile);
+
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: "Stress calculation completed".to_string(),
+        data: Some(result),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConcentrationPredictionRequest {
+    pub surface_concentration: f64,
+    pub total_time_hours: f64,
+    pub permeability: Option<f64>,
+    pub viscosity: Option<f64>,
+    pub diffusion_coefficient: Option<f64>,
+    pub pressure_gradient: Option<f64>,
+    pub porosity: Option<f64>,
+    pub num_grid_x: Option<usize>,
+    pub num_grid_y: Option<usize>,
+}
+
+pub async fn predict_peg_concentration(
+    _solver: web::Data<ConvectionDiffusionSolver>,
+    body: web::Json<ConcentrationPredictionRequest>,
+) -> impl Responder {
+    let mut config = crate::convection_diffusion::ConvectionDiffusionConfig::default();
+
+    if let Some(p) = body.permeability {
+        config.permeability = p;
+    }
+    if let Some(v) = body.viscosity {
+        config.viscosity = v;
+    }
+    if let Some(d) = body.diffusion_coefficient {
+        config.diffusion_coefficient = d;
+    }
+    if let Some(pg) = body.pressure_gradient {
+        config.pressure_gradient = pg;
+    }
+    if let Some(por) = body.porosity {
+        config.porosity = por;
+    }
+    if let Some(nx) = body.num_grid_x {
+        config.num_grid_x = nx;
+    }
+    if let Some(ny) = body.num_grid_y {
+        config.num_grid_y = ny;
+    }
+    config.surface_concentration = body.surface_concentration;
+    config.total_time_hours = body.total_time_hours;
+
+    let solver = crate::convection_diffusion::ConvectionDiffusionSolver::new(config);
+    let result = solver.solve();
+
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: "PEG concentration prediction completed".to_string(),
+        data: Some(result),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GprEndpointRequest {
+    pub time_hours: Vec<f64>,
+    pub moisture_values: Vec<f64>,
+    pub target_moisture: Option<f64>,
+    pub confidence_level: Option<f64>,
+    pub kernel_type: Option<String>,
+    pub optimize_hyperparams: Option<bool>,
+}
+
+pub async fn predict_endpoint_gpr(
+    _regressor: web::Data<GaussianProcessRegressor>,
+    body: web::Json<GprEndpointRequest>,
+) -> impl Responder {
+    if body.time_hours.len() != body.moisture_values.len() {
+        return HttpResponse::BadRequest().json(ApiResponse::<String> {
+            success: false,
+            message: "Time and moisture arrays must have same length".to_string(),
+            data: None,
+        });
+    }
+
+    if body.time_hours.len() < 2 {
+        return HttpResponse::BadRequest().json(ApiResponse::<String> {
+            success: false,
+            message: "Need at least 2 data points".to_string(),
+            data: None,
+        });
+    }
+
+    let mut config = crate::gpr_prediction::GPRConfig::default();
+    if let Some(t) = body.target_moisture {
+        config.target_moisture = t;
+    }
+    if let Some(c) = body.confidence_level {
+        config.confidence_level = c;
+    }
+    if let Some(k) = &body.kernel_type {
+        config.kernel_type = k.clone();
+    }
+
+    let mut gpr = crate::gpr_prediction::GaussianProcessRegressor::new(config);
+
+    if body.optimize_hyperparams.unwrap_or(false) {
+        if let Err(e) = gpr.optimize_hyperparameters(&body.time_hours, &body.moisture_values) {
+            return HttpResponse::InternalServerError().json(ApiResponse::<String> {
+                success: false,
+                message: format!("Hyperparameter optimization failed: {}", e),
+                data: None,
+            });
+        }
+    } else {
+        if let Err(e) = gpr.fit(&body.time_hours, &body.moisture_values) {
+            return HttpResponse::InternalServerError().json(ApiResponse::<String> {
+                success: false,
+                message: format!("GPR fitting failed: {}", e),
+                data: None,
+            });
+        }
+    }
+
+    match gpr.predict_endpoint() {
+        Ok(result) => HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: "GPR endpoint prediction completed".to_string(),
+            data: Some(result),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<String> {
+            success: false,
+            message: format!("Prediction failed: {}", e),
+            data: None,
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StabilityAssessmentRequest {
+    pub initial_moisture: Option<f64>,
+    pub low_moisture: Option<f64>,
+    pub high_moisture: Option<f64>,
+    pub agent_type: Option<String>,
+    pub agent_concentration: Option<f64>,
+    pub peg_molecular_weight: Option<f64>,
+    pub num_cycles: Option<usize>,
+    pub cycle_duration_hours: Option<f64>,
+    pub compare_without_reinforcement: Option<bool>,
+}
+
+pub async fn assess_dimensional_stability(
+    _simulator: web::Data<DimensionalStabilitySimulator>,
+    body: web::Json<StabilityAssessmentRequest>,
+) -> impl Responder {
+    let mut config = crate::dimensional_stability::DimensionalStabilityConfig::default();
+
+    if let Some(im) = body.initial_moisture {
+        config.initial_moisture = im;
+    }
+    if let Some(lm) = body.low_moisture {
+        config.low_moisture = lm;
+    }
+    if let Some(hm) = body.high_moisture {
+        config.high_moisture = hm;
+    }
+    if let Some(at) = &body.agent_type {
+        config.agent_type = at.clone();
+    }
+    if let Some(ac) = body.agent_concentration {
+        config.agent_concentration = ac;
+    }
+    if let Some(mw) = body.peg_molecular_weight {
+        config.peg_molecular_weight = mw;
+    }
+    if let Some(nc) = body.num_cycles {
+        config.num_cycles = nc;
+    }
+    if let Some(cd) = body.cycle_duration_hours {
+        config.cycle_duration_hours = cd;
+    }
+
+    let simulator = crate::dimensional_stability::DimensionalStabilitySimulator::new(config);
+    let result = simulator.simulate();
+
+    let mut response_data = serde_json::json!({
+        "with_reinforcement": result,
+    });
+
+    if body.compare_without_reinforcement.unwrap_or(false) {
+        let no_agent_result = simulator.compare_without_reinforcement();
+        response_data = serde_json::json!({
+            "with_reinforcement": result,
+            "without_reinforcement": no_agent_result,
+        });
+    }
+
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: "Dimensional stability assessment completed".to_string(),
+        data: Some(response_data),
+    })
 }
