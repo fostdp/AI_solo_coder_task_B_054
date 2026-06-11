@@ -1,0 +1,168 @@
+# ============================================================
+# 古代竹木漆器脱水加固监测系统 - Docker Compose 编排
+# ============================================================
+# 服务列表：
+#   - timescaledb: 时序数据库（TimescaleDB + PostgreSQL）
+#   - backend: Rust 后端服务（Actix-web + API + 前端静态文件）
+#   - simulator: NB-IoT 数据模拟器
+#   - prometheus: Prometheus 监控系统
+# ============================================================
+
+version: '3.8'
+
+services:
+
+  # ============================================================
+  # TimescaleDB 数据库
+  # ============================================================
+  timescaledb:
+    image: timescale/timescaledb:2.15.3-pg16
+    container_name: lacquer-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-lacquer_monitor}
+      TZ: Asia/Shanghai
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-lacquer_monitor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - lacquer-network
+
+  # ============================================================
+  # Rust 后端服务
+  # ============================================================
+  backend:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+    container_name: lacquer-backend
+    restart: unless-stopped
+    environment:
+      # Server
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8080
+      SERVER_WORKERS: ${SERVER_WORKERS:-4}
+      STATIC_DIR: /app/frontend
+      # Database
+      DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@timescaledb:5432/${DB_NAME:-lacquer_monitor}
+      DB_POOL_SIZE: ${DB_POOL_MAX_SIZE:-16}
+      DB_POOL_WAIT_TIMEOUT: ${DB_POOL_TIMEOUT_WAIT:-30}
+      # Diffusion
+      DIFFUSION_COEFFICIENT: ${DIFFUSION_COEFFICIENT:-1e-9}
+      SAMPLE_THICKNESS: ${DIFFUSION_THICKNESS:-0.05}
+      CRUSTING_ALPHA: ${DIFFUSION_CROSTING_ALPHA:-0.8}
+      CRUST_THRESHOLD: ${DIFFUSION_CRUST_THRESHOLD:-30.0}
+      DIFFUSION_NUM_POINTS: ${DIFFUSION_DEFAULT_NUM_POINTS:-100}
+      # Penetration
+      PENETRATION_DEFAULT_PERMEABILITY: ${PENETRATION_DEFAULT_PERMEABILITY:-1e-14}
+      PENETRATION_DEFAULT_POROSITY: ${PENETRATION_DEFAULT_POROSITY:-0.4}
+      PENETRATION_DEFAULT_VISCOSITY: ${PENETRATION_DEFAULT_VISCOSITY:-0.056}
+      PENETRATION_DEFAULT_PRESSURE_DIFF: ${PENETRATION_DEFAULT_PRESSURE_DIFF:-101325.0}
+      PENETRATION_SAMPLE_LENGTH: ${PENETRATION_SAMPLE_LENGTH:-0.5}
+      PENETRATION_NUM_POINTS: ${PENETRATION_DEFAULT_NUM_POINTS:-50}
+      # Alert
+      ALERT_MOISTURE_DROP_THRESHOLD: ${ALERT_MOISTURE_DROP_THRESHOLD:-10.0}
+      ALERT_STRAIN_THRESHOLD: ${ALERT_STRAIN_THRESHOLD:-5.0}
+      ALERT_SMS_URL: ${ALERT_SMS_URL:-https://sms.example.com/send}
+      ALERT_SMS_TOKEN: ${ALERT_SMS_TOKEN:-dummy-token}
+      ALERT_SATELLITE_URL: ${ALERT_SATELLITE_URL:-https://satellite.example.com/send}
+      ALERT_SATELLITE_API_KEY: ${ALERT_SATELLITE_API_KEY:-dummy-key}
+      ALERT_RECIPIENTS: ${ALERT_RECIPIENTS:-+8613800138000}
+      # NB-IoT
+      NBIOT_CHANNEL_CAPACITY: ${NBIOT_CHANNEL_CAPACITY:-1000}
+      NBIOT_BATCH_SIZE: ${NBIOT_BATCH_SIZE:-100}
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info,lacquer_monitor_backend=info}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./frontend:/app/frontend:ro
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/statistics || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - lacquer-network
+
+  # ============================================================
+  # NB-IoT 数据模拟器
+  # ============================================================
+  simulator:
+    build:
+      context: .
+      dockerfile: ./simulator/Dockerfile
+    container_name: lacquer-simulator
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://backend:8080/api
+      REPORT_INTERVAL: ${REPORT_INTERVAL:-3600}
+      NUM_WARES: ${NUM_WARES:-50}
+      BATCH_SIZE: ${SIMULATOR_BATCH_SIZE:-50}
+      CONTROL_PORT: ${CONTROL_PORT:-8081}
+      TZ: Asia/Shanghai
+    ports:
+      - "${CONTROL_PORT:-8081}:8081"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - lacquer-network
+
+  # ============================================================
+  # Prometheus 监控
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: lacquer-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - lacquer-network
+
+# ============================================================
+# 数据卷
+# ============================================================
+volumes:
+  timescaledb_data:
+  prometheus_data:
+
+# ============================================================
+# 网络
+# ============================================================
+networks:
+  lacquer-network:
+    driver: bridge
