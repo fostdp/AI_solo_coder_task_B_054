@@ -7,6 +7,10 @@ mod peg_penetration;
 mod alert_broker;
 mod handlers;
 mod metrics;
+mod dehydration_stress;
+mod convection_diffusion;
+mod gpr_prediction;
+mod dimensional_stability;
 
 use actix_web::{web, App, HttpServer, middleware};
 use actix_cors::Cors;
@@ -65,6 +69,21 @@ async fn main() -> std::io::Result<()> {
         app_config.penetration.clone(),
     );
 
+    let stress_solver = dehydration_stress::DehydrationStressSolver::new(
+        dehydration_stress::StressConfig::default(),
+    );
+
+    let convection_solver = convection_diffusion::ConvectionDiffusionSolver::new(
+        convection_diffusion::ConvectionDiffusionConfig::default(),
+    );
+
+    let gpr_config = gpr_prediction::GPRConfig::default();
+    let gpr_regressor = gpr_prediction::GaussianProcessRegressor::new(gpr_config);
+
+    let stability_simulator = dimensional_stability::DimensionalStabilitySimulator::new(
+        dimensional_stability::DimensionalStabilityConfig::default(),
+    );
+
     let host = app_config.server.host.clone();
     let port = app_config.server.port;
     let workers = app_config.server.workers;
@@ -85,6 +104,10 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(ingest_service.clone()))
             .app_data(web::Data::new(diffusion_service.clone()))
             .app_data(web::Data::new(penetration_service.clone()))
+            .app_data(web::Data::new(stress_solver.clone()))
+            .app_data(web::Data::new(convection_solver.clone()))
+            .app_data(web::Data::new(gpr_regressor.clone()))
+            .app_data(web::Data::new(stability_simulator.clone()))
             .wrap(cors)
             .wrap(middleware::Compress::default())
             .wrap(middleware::Logger::default())
@@ -105,6 +128,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/nb-iot/data", web::post().to(handlers::receive_nb_iot_data))
                     .route("/nb-iot/batch", web::post().to(handlers::receive_nb_iot_batch))
                     .route("/metrics", web::get().to(handlers::get_metrics))
+                    .route("/stress/dehydration", web::post().to(handlers::compute_dehydration_stress))
+                    .route("/concentration/peg", web::post().to(handlers::predict_peg_concentration))
+                    .route("/prediction/gpr-endpoint", web::post().to(handlers::predict_endpoint_gpr))
+                    .route("/stability/dimensional", web::post().to(handlers::assess_dimensional_stability))
             )
             .service(
                 fs::Files::new("/", &static_dir)
