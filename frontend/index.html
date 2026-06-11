@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>古代竹木漆器脱水加固监测系统</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <header class="top-bar">
+            <div class="logo">
+                <span class="logo-icon">🏺</span>
+                <h1>古代竹木漆器脱水加固监测系统</h1>
+            </div>
+            <div class="header-stats">
+                <div class="stat-card">
+                    <span class="stat-label">漆器总数</span>
+                    <span class="stat-value" id="totalWares">50</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">传感器</span>
+                    <span class="stat-value" id="totalSensors">50</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">平均含水率</span>
+                    <span class="stat-value moisture" id="avgMoisture">--</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">活动告警</span>
+                    <span class="stat-value alert" id="activeAlerts">0</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>漆器列表</h3>
+                    <div class="ware-list" id="wareList">
+                    </div>
+                </div>
+                <div class="sidebar-section">
+                    <h3>显示模式</h3>
+                    <div class="mode-selector">
+                        <button class="mode-btn active" data-mode="moisture">
+                            <span class="mode-icon">💧</span>
+                            含水率热力图
+                        </button>
+                        <button class="mode-btn" data-mode="strain">
+                            <span class="mode-icon">📏</span>
+                            收缩应变网格
+                        </button>
+                        <button class="mode-btn" data-mode="both">
+                            <span class="mode-icon">🎯</span>
+                            综合显示
+                        </button>
+                    </div>
+                </div>
+                <div class="sidebar-section">
+                    <h3>传感器信息</h3>
+                    <div class="sensor-info" id="sensorInfo">
+                        <p class="empty-text">选择漆器查看详情</p>
+                    </div>
+                </div>
+            </aside>
+
+            <main class="view-area">
+                <div class="viewer-container">
+                    <div id="threeCanvas" class="three-canvas"></div>
+                    <div class="viewer-controls">
+                        <button id="resetView" class="ctrl-btn" title="重置视角">🔄</button>
+                        <button id="toggleWireframe" class="ctrl-btn" title="线框模式">📐</button>
+                        <button id="toggleAutoRotate" class="ctrl-btn" title="自动旋转">🔃</button>
+                        <button id="zoomIn" class="ctrl-btn" title="放大">➕</button>
+                        <button id="zoomOut" class="ctrl-btn" title="缩小">➖</button>
+                    </div>
+                    <div class="legend">
+                        <h4>含水率 (%)</h4>
+                        <div class="color-bar moisture-bar"></div>
+                        <div class="color-labels">
+                            <span>10</span>
+                            <span>30</span>
+                            <span>50</span>
+                            <span>70</span>
+                            <span>90</span>
+                        </div>
+                    </div>
+                    <div class="legend strain-legend">
+                        <h4>收缩应变 (%)</h4>
+                        <div class="color-bar strain-bar"></div>
+                        <div class="color-labels">
+                            <span>0</span>
+                            <span>2</span>
+                            <span>4</span>
+                            <span>6</span>
+                            <span>8+</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="data-panels">
+                    <div class="data-panel">
+                        <h3>💧 含水率趋势</h3>
+                        <canvas id="moistureChart" width="400" height="150"></canvas>
+                    </div>
+                    <div class="data-panel">
+                        <h3>📏 应变趋势</h3>
+                        <canvas id="strainChart" width="400" height="150"></canvas>
+                    </div>
+                    <div class="data-panel">
+                        <h3>🔬 脱水预测 (Fickian扩散)</h3>
+                        <canvas id="predictionChart" width="400" height="150"></canvas>
+                    </div>
+                    <div class="data-panel">
+                        <h3>🧪 加固剂渗透 (达西定律)</h3>
+                        <canvas id="penetrationChart" width="400" height="150"></canvas>
+                    </div>
+                </div>
+            </main>
+
+            <aside class="right-panel">
+                <div class="panel-section">
+                    <h3>🚨 最新告警</h3>
+                    <div class="alert-list" id="alertList">
+                        <p class="empty-text">暂无告警</p>
+                    </div>
+                </div>
+                <div class="panel-section">
+                    <h3>📊 脱水参数</h3>
+                    <div class="param-list">
+                        <div class="param-item">
+                            <span class="param-label">扩散系数</span>
+                            <span class="param-value">1e-9 m²/s</span>
+                        </div>
+                        <div class="param-item">
+                            <span class="param-label">初始含水率</span>
+                            <span class="param-value" id="initMoisture">--%</span>
+                        </div>
+                        <div class="param-item">
+                            <span class="param-label">目标含水率</span>
+                            <span class="param-value">12%</span>
+                        </div>
+                        <div class="param-item">
+                            <span class="param-label">预计脱水时间</span>
+                            <span class="param-value" id="estTime">-- 天</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="panel-section">
+                    <h3>🧪 加固方案</h3>
+                    <div class="agent-list" id="agentList">
+                    </div>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="js/LacquerModel.js"></script>
+    <script src="js/MoistureHeatmap.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
