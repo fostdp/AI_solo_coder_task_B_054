@@ -1,0 +1,111 @@
+﻿cargo : warning: struct `PenetrationPrediction` is never constructed
+所在位置 行:1 字符: 229
++ ... 054\backend ; cargo test -- --test-threads=1 --nocapture 2>&1 | Out-F ...
++                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: struct...ver constructed 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  --> src\models.rs:70:12
+   |
+70 | pub struct PenetrationPrediction {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `config` is never used
+  --> src\nbiot_ingest.rs:28:12
+   |
+23 | impl NbiotIngestService {
+   | ----------------------- method in this implementation
+...
+28 |     pub fn config(&self) -> &NbIotConfig {
+   |            ^^^^^^
+
+warning: methods `with_crusting`, `predict_with_depth_profile`, and `moisture_a
+t_depth` are never used
+   --> src\moisture_diffusion.rs:18:12
+    |
+  9 | impl MoistureDiffusionService {
+    | ----------------------------- methods in this implementation
+...
+ 18 |     pub fn with_crusting(mut self, alpha: f64, threshold: f64) -> Self {
+    |            ^^^^^^^^^^^^^
+...
+116 |     pub fn predict_with_depth_profile(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+200 |     pub fn moisture_at_depth(&self, depth: f64, time_hours: f64, initial_
+moisture: f64, surface_moisture: f64) -> f64 {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: methods `config` and `penetration_velocity` are never used
+  --> src\peg_penetration.rs:13:12
+   |
+ 8 | impl PegPenetrationService {
+   | -------------------------- methods in this implementation
+...
+13 |     pub fn config(&self) -> &PenetrationConfig {
+   |            ^^^^^^
+...
+57 |     pub fn penetration_velocity(&self, pressure_diff: f64, current_depth: 
+f64) -> f64 {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `get_recent_alerts` is never used
+   --> src\alert_broker.rs:290:18
+    |
+ 23 | impl AlertBroker {
+    | ---------------- method in this implementation
+...
+290 |     pub async fn get_recent_alerts(&self, limit: i64) -> Result<Vec<Alert
+>, Box<dyn std::error::Error + Send + Sync>> {
+    |                  ^^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+  --> src\metrics.rs:8:9
+   |
+ 7 | pub struct Metrics {
+   |            ------- fields in this struct
+ 8 |     pub http_requests_total: IntCounter,
+   |         ^^^^^^^^^^^^^^^^^^^
+ 9 |     pub http_request_duration_seconds: Histogram,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10 |     pub http_active_requests: IntGauge,
+   |         ^^^^^^^^^^^^^^^^^^^^
+11 |     pub nbiot_packets_total: IntCounter,
+   |         ^^^^^^^^^^^^^^^^^^^
+12 |     pub nbiot_packets_failed: IntCounter,
+   |         ^^^^^^^^^^^^^^^^^^^^
+13 |     pub alerts_triggered_total: IntCounter,
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+14 |     pub db_connections_active: IntGauge,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+15 |     pub db_connections_idle: IntGauge,
+   |         ^^^^^^^^^^^^^^^^^^^
+16 |     pub moisture_readings_total: IntCounter,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+17 |     pub strain_readings_total: IntCounter,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `get` is never used
+  --> src\metrics.rs:84:12
+   |
+22 | impl Metrics {
+   | ------------ associated function in this implementation
+...
+84 |     pub fn get() -> &'static Self {
+   |            ^^^
+
+warning: `lacquer-monitor-backend` (bin "lacquer-monitor-backend" test) generat
+ed 7 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src\main.rs (target\debug\deps\lacquer_monitor_backend-1
+842b966a47fc657.exe)
+
+running 9 tests
+test moisture_diffusion::tests::test_concentration_dependent_diffusion ... ok
+test moisture_diffusion::tests::test_crusting_slows_early_dehydration ... ok
+test moisture_diffusion::tests::test_edge_case_single_point ... ok
+test moisture_diffusion::tests::test_edge_case_zero_diffusion ... ok
+test moisture_diffusion::tests::test_edge_case_zero_thickness ... 
