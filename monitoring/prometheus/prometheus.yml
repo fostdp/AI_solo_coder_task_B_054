@@ -1,0 +1,51 @@
+# ============================================================
+# Prometheus 配置 - 古代竹木漆器脱水加固监测系统
+# ============================================================
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'lacquer-monitor'
+
+# 告警规则配置
+rule_files:
+  # - "alert.rules.yml"
+
+# Alertmanager 配置
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+# 抓取配置
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Rust 后端服务监控
+  - job_name: 'backend'
+    metrics_path: '/api/metrics'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['backend:8080']
+        labels:
+          service: 'lacquer-monitor-backend'
+
+  # NB-IoT 模拟器监控（可选，通过 Python HTTP API）
+  - job_name: 'nb-iot-simulator'
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['simulator:8081']
+        labels:
+          service: 'nb-iot-simulator'
+
+  # TimescaleDB / PostgreSQL 监控（需要 pg_exporter）
+  # - job_name: 'postgres'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']
+  #       labels:
+  #         service: 'timescaledb'
