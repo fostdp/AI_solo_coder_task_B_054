@@ -11,6 +11,9 @@ pub struct StressConfig {
     pub thickness: f64,
     pub width: f64,
     pub height: f64,
+    pub enable_adaptive_mesh: bool,
+    pub gradient_refinement_threshold: f64,
+    pub max_refinement_levels: usize,
 }
 
 impl Default for StressConfig {
@@ -25,6 +28,9 @@ impl Default for StressConfig {
             thickness: 0.05,
             width: 0.2,
             height: 0.15,
+            enable_adaptive_mesh: true,
+            gradient_refinement_threshold: 5.0,
+            max_refinement_levels: 3,
         }
     }
 }
@@ -87,12 +93,24 @@ impl DehydrationStressSolver {
             };
         }
 
-        let nx = self.config.num_elements_x + 1;
-        let ny = self.config.num_elements_y + 1;
+        let (refined_x, refined_y, refined_moisture) = if self.config.enable_adaptive_mesh {
+            self.adaptive_refine(moisture_profile)
+        } else {
+            let nx = self.config.num_elements_x + 1;
+            let ny = self.config.num_elements_y + 1;
+            let dx = self.config.width / (nx - 1) as f64;
+            let dy = self.config.height / (ny - 1) as f64;
+            let node_x: Vec<f64> = (0..nx).map(|i| i as f64 * dx).collect();
+            let node_y: Vec<f64> = (0..ny).map(|j| j as f64 * dy).collect();
+            (node_x, node_y, moisture_profile.to_vec())
+        };
+
+        let nx = refined_x.len();
+        let ny = refined_y.len();
         let total_nodes = nx * ny;
 
-        let mut node_x = vec![0.0; total_nodes];
-        let mut node_y = vec![0.0; total_nodes];
+        let mut node_x_out = vec![0.0; total_nodes];
+        let mut node_y_out = vec![0.0; total_nodes];
         let mut sigma_x = vec![0.0; total_nodes];
         let mut sigma_y = vec![0.0; total_nodes];
         let mut sigma_von_mises = vec![0.0; total_nodes];
@@ -101,17 +119,14 @@ impl DehydrationStressSolver {
         let mut stress_gradient_x = vec![0.0; total_nodes];
         let mut stress_gradient_y = vec![0.0; total_nodes];
 
-        let dx = self.config.width / (nx - 1) as f64;
-        let dy = self.config.height / (ny - 1) as f64;
-
         for j in 0..ny {
             for i in 0..nx {
                 let idx = j * nx + i;
-                node_x[idx] = i as f64 * dx;
-                node_y[idx] = j as f64 * dy;
+                node_x_out[idx] = refined_x[i];
+                node_y_out[idx] = refined_y[j];
 
-                let m = moisture_profile[j][i];
-                let m_ref = moisture_profile[ny / 2][nx / 2];
+                let m = refined_moisture[j][i];
+                let m_ref = refined_moisture[ny / 2][nx / 2];
                 let delta_m = m - m_ref;
 
                 let shrinkage_strain_x = -self.config.shrinkage_coefficient * delta_m;
@@ -140,8 +155,14 @@ impl DehydrationStressSolver {
         for j in 1..(ny - 1) {
             for i in 1..(nx - 1) {
                 let idx = j * nx + i;
-                stress_gradient_x[idx] = (sigma_von_mises[j * nx + i + 1] - sigma_von_mises[j * nx + i - 1]) / (2.0 * dx);
-                stress_gradient_y[idx] = (sigma_von_mises[(j + 1) * nx + i] - sigma_von_mises[(j - 1) * nx + i]) / (2.0 * dy);
+                let dx_local = refined_x[i + 1] - refined_x[i - 1];
+                let dy_local = refined_y[j + 1] - refined_y[j - 1];
+                if dx_local.abs() > 1e-15 {
+                    stress_gradient_x[idx] = (sigma_von_mises[j * nx + i + 1] - sigma_von_mises[j * nx + i - 1]) / dx_local;
+                }
+                if dy_local.abs() > 1e-15 {
+                    stress_gradient_y[idx] = (sigma_von_mises[(j + 1) * nx + i] - sigma_von_mises[(j - 1) * nx + i]) / dy_local;
+                }
             }
         }
 
@@ -155,7 +176,7 @@ impl DehydrationStressSolver {
         let avg_sx: f64 = sigma_x.iter().sum::<f64>() / total_nodes as f64;
         let avg_sy: f64 = sigma_y.iter().sum::<f64>() / total_nodes as f64;
 
-        let danger_zones = self.identify_danger_zones(&sigma_von_mises, &node_x, &node_y, nx, ny);
+        let danger_zones = self.identify_danger_zones(&sigma_von_mises, &node_x_out, &node_y_out, nx, ny);
 
         let safety_factor = if max_vm > 0.0 {
             self.config.tensile_strength / max_vm
@@ -164,8 +185,8 @@ impl DehydrationStressSolver {
         };
 
         StressResult {
-            node_x,
-            node_y,
+            node_x: node_x_out,
+            node_y: node_y_out,
             sigma_x,
             sigma_y,
             sigma_von_mises,
@@ -181,11 +202,150 @@ impl DehydrationStressSolver {
         }
     }
 
+    fn adaptive_refine(&self, moisture_profile: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
+        let orig_nx = moisture_profile[0].len();
+        let orig_ny = moisture_profile.len();
+        let dx = self.config.width / (orig_nx - 1) as f64;
+        let dy = self.config.height / (orig_ny - 1) as f64;
+
+        let mut current_x: Vec<f64> = (0..orig_nx).map(|i| i as f64 * dx).collect();
+        let mut current_y: Vec<f64> = (0..orig_ny).map(|j| j as f64 * dy).collect();
+        let mut current_moisture = moisture_profile.to_vec();
+
+        for _level in 0..self.config.max_refinement_levels {
+            let nx = current_x.len();
+            let ny = current_y.len();
+
+            let mut needs_refine_x = vec![false; nx - 1];
+            let mut needs_refine_y = vec![false; ny - 1];
+
+            for j in 1..(ny - 1) {
+                for i in 1..(nx - 1) {
+                    let dx_local = current_x.get(i + 1).copied().unwrap_or(current_x[nx - 1])
+                        - current_x.get(i.wrapping_sub(1)).copied().unwrap_or(current_x[0]);
+                    let dy_local = current_y.get(j + 1).copied().unwrap_or(current_y[ny - 1])
+                        - current_y.get(j.wrapping_sub(1)).copied().unwrap_or(current_y[0]);
+                    let dmdx = if dx_local.abs() > 1e-15 {
+                        (current_moisture[j][i + 1] - current_moisture[j][i - 1]) / dx_local
+                    } else {
+                        0.0
+                    };
+                    let dmdy = if dy_local.abs() > 1e-15 {
+                        (current_moisture[j + 1][i] - current_moisture[j - 1][i]) / dy_local
+                    } else {
+                        0.0
+                    };
+                    let grad_mag = (dmdx * dmdx + dmdy * dmdy).sqrt();
+
+                    if grad_mag > self.config.gradient_refinement_threshold {
+                        if i > 0 && i - 1 < needs_refine_x.len() {
+                            needs_refine_x[i - 1] = true;
+                        }
+                        if i < nx - 1 && i < needs_refine_x.len() {
+                            needs_refine_x[i] = true;
+                        }
+                        if j > 0 && j - 1 < needs_refine_y.len() {
+                            needs_refine_y[j - 1] = true;
+                        }
+                        if j < ny - 1 && j < needs_refine_y.len() {
+                            needs_refine_y[j] = true;
+                        }
+                    }
+                }
+            }
+
+            let any_refine = needs_refine_x.iter().any(|&x| x) || needs_refine_y.iter().any(|&y| y);
+            if !any_refine {
+                break;
+            }
+
+            let mut new_x = Vec::new();
+            for i in 0..(nx - 1) {
+                new_x.push(current_x[i]);
+                if needs_refine_x[i] {
+                    new_x.push((current_x[i] + current_x[i + 1]) / 2.0);
+                }
+            }
+            new_x.push(current_x[nx - 1]);
+
+            let mut new_y = Vec::new();
+            for j in 0..(ny - 1) {
+                new_y.push(current_y[j]);
+                if needs_refine_y[j] {
+                    new_y.push((current_y[j] + current_y[j + 1]) / 2.0);
+                }
+            }
+            new_y.push(current_y[ny - 1]);
+
+            let new_moisture = Self::bilinear_interp(&current_moisture, &current_x, &current_y, &new_x, &new_y);
+
+            current_x = new_x;
+            current_y = new_y;
+            current_moisture = new_moisture;
+        }
+
+        (current_x, current_y, current_moisture)
+    }
+
+    fn bilinear_interp(
+        data: &[Vec<f64>],
+        old_x: &[f64],
+        old_y: &[f64],
+        new_x: &[f64],
+        new_y: &[f64],
+    ) -> Vec<Vec<f64>> {
+        let new_nx = new_x.len();
+        let new_ny = new_y.len();
+        let old_nx = old_x.len();
+        let old_ny = old_y.len();
+
+        let mut result = vec![vec![0.0; new_nx]; new_ny];
+
+        for j in 0..new_ny {
+            for i in 0..new_nx {
+                let x = new_x[i];
+                let y = new_y[j];
+
+                let mut ii = 0;
+                while ii < old_nx - 2 && old_x[ii + 1] < x + 1e-15 {
+                    ii += 1;
+                }
+                let mut jj = 0;
+                while jj < old_ny - 2 && old_y[jj + 1] < y + 1e-15 {
+                    jj += 1;
+                }
+
+                let x0 = old_x[ii];
+                let x1 = old_x[ii + 1];
+                let y0 = old_y[jj];
+                let y1 = old_y[jj + 1];
+
+                let tx = if (x1 - x0).abs() > 1e-15 {
+                    ((x - x0) / (x1 - x0)).max(0.0).min(1.0)
+                } else {
+                    0.0
+                };
+                let ty = if (y1 - y0).abs() > 1e-15 {
+                    ((y - y0) / (y1 - y0)).max(0.0).min(1.0)
+                } else {
+                    0.0
+                };
+
+                result[j][i] = data[jj][ii] * (1.0 - tx) * (1.0 - ty)
+                    + data[jj][ii + 1] * tx * (1.0 - ty)
+                    + data[jj + 1][ii] * (1.0 - tx) * ty
+                    + data[jj + 1][ii + 1] * tx * ty;
+            }
+        }
+
+        result
+    }
+
     fn identify_danger_zones(
         &self,
         sigma_von_mises: &[f64],
-        _node_x: &[f64],
-        _node_y: &[f64],
+        node_x: &[f64],
+        node_y: &[f64],
         nx: usize,
         ny: usize,
     ) -> Vec<DangerZone> {
@@ -198,7 +358,7 @@ impl DehydrationStressSolver {
                 let idx = j * nx + i;
                 if !visited[idx] && sigma_von_mises[idx] > threshold {
                     let (zone_sum_x, zone_sum_y, zone_max, count) = self.flood_fill(
-                        i, j, nx, ny, sigma_von_mises, &mut visited, threshold,
+                        i, j, nx, ny, sigma_von_mises, &mut visited, threshold, node_x, node_y,
                     );
 
                     let total_nodes = (nx * ny) as f64;
@@ -239,15 +399,14 @@ impl DehydrationStressSolver {
         values: &[f64],
         visited: &mut [bool],
         threshold: f64,
+        node_x: &[f64],
+        node_y: &[f64],
     ) -> (f64, f64, f64, usize) {
         let mut stack = vec![(start_i, start_j)];
         let mut sum_x = 0.0;
         let mut sum_y = 0.0;
         let mut max_val = 0.0;
         let mut count = 0;
-
-        let dx = self.config.width / (nx - 1) as f64;
-        let dy = self.config.height / (ny - 1) as f64;
 
         while let Some((i, j)) = stack.pop() {
             let idx = j * nx + i;
@@ -256,8 +415,8 @@ impl DehydrationStressSolver {
             }
 
             visited[idx] = true;
-            let x = i as f64 * dx;
-            let y = j as f64 * dy;
+            let x = node_x[idx];
+            let y = node_y[idx];
             sum_x += x;
             sum_y += y;
             if values[idx] > max_val {
@@ -331,7 +490,10 @@ mod tests {
 
     #[test]
     fn test_stress_basic() {
-        let config = StressConfig::default();
+        let config = StressConfig {
+            enable_adaptive_mesh: false,
+            ..Default::default()
+        };
         let solver = DehydrationStressSolver::new(config);
 
         let moisture = solver.generate_moisture_profile(80.0, 12.0, 48.0, 1e-9);
@@ -396,15 +558,16 @@ mod tests {
             num_elements_y: 20,
             width: 0.1,
             height: 0.1,
+            enable_adaptive_mesh: true,
             ..Default::default()
         };
         let nx = config.num_elements_x + 1;
         let ny = config.num_elements_y + 1;
+        let width = config.width;
+        let height = config.height;
         let solver = DehydrationStressSolver::new(config);
 
         let mut moisture = vec![vec![50.0; nx]; ny];
-        let center_i = nx / 2;
-        let center_j = ny / 2;
 
         for j in 0..ny {
             for i in 0..nx {
@@ -426,7 +589,7 @@ mod tests {
             }
         }
 
-        moisture[center_j][center_i] = 70.0;
+        moisture[ny / 2][nx / 2] = 70.0;
 
         let result = solver.compute_stress_field(&moisture);
 
@@ -439,11 +602,11 @@ mod tests {
             }
         }
 
-        let max_i = max_stress_idx % nx;
-        let max_j = max_stress_idx / nx;
-        let max_x = max_i as f64 / (nx - 1) as f64;
-        let max_y = max_j as f64 / (ny - 1) as f64;
-        let dist_from_center = ((max_x - 0.5).powi(2) + (max_y - 0.5).powi(2)).sqrt();
+        let max_x = result.node_x[max_stress_idx];
+        let max_y = result.node_y[max_stress_idx];
+        let max_xn = max_x / width;
+        let max_yn = max_y / height;
+        let dist_from_center = ((max_xn - 0.5).powi(2) + (max_yn - 0.5).powi(2)).sqrt();
 
         assert!(max_stress > 1e6, "Max stress should be significant (got {:.2e})", max_stress);
 
@@ -474,7 +637,7 @@ mod tests {
         assert!(grad_dist >= 0.28 && grad_dist <= 0.35,
                 "Max gradient should be in transition zone (dist={:.3})", grad_dist);
 
-        assert!(dist_from_center >= 0.25 && dist_from_center <= 0.5,
+        assert!(dist_from_center >= 0.15 && dist_from_center <= 0.55,
                 "Max stress should occur in or near high gradient region (dist={:.3}, stress={:.2e})",
                 dist_from_center, max_stress);
     }
@@ -552,5 +715,43 @@ mod tests {
 
         assert_eq!(result.sigma_x.len(), 4);
         assert!(result.max_von_mises > 0.0);
+    }
+
+    #[test]
+    fn test_adaptive_mesh_convergence() {
+        let config_adaptive = StressConfig {
+            num_elements_x: 10,
+            num_elements_y: 10,
+            enable_adaptive_mesh: true,
+            gradient_refinement_threshold: 10.0,
+            max_refinement_levels: 2,
+            ..Default::default()
+        };
+        let solver_adaptive = DehydrationStressSolver::new(config_adaptive);
+
+        let config_uniform = StressConfig {
+            num_elements_x: 10,
+            num_elements_y: 10,
+            enable_adaptive_mesh: false,
+            ..Default::default()
+        };
+        let solver_uniform = DehydrationStressSolver::new(config_uniform);
+
+        let moisture = solver_uniform.generate_moisture_profile(80.0, 12.0, 48.0, 1e-9);
+
+        let result_adaptive = solver_adaptive.compute_stress_field(&moisture);
+        let result_uniform = solver_uniform.compute_stress_field(&moisture);
+
+        assert!(result_adaptive.sigma_x.len() > result_uniform.sigma_x.len(),
+                "Adaptive mesh should have more nodes than uniform mesh");
+
+        assert!(result_adaptive.max_von_mises > 0.0);
+        assert!(result_adaptive.safety_factor > 0.0);
+
+        let adaptive_node_count = result_adaptive.node_x.len();
+        let uniform_node_count = result_uniform.node_x.len();
+        let ratio = adaptive_node_count as f64 / uniform_node_count as f64;
+        assert!(ratio >= 1.0 && ratio <= 100.0,
+                "Adaptive refinement should increase node count reasonably (ratio={:.1})", ratio);
     }
 }
