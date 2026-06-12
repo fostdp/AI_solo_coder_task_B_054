@@ -17,7 +17,7 @@ impl Default for GPRConfig {
             length_scale: 100.0,
             signal_variance: 25.0,
             noise_variance: 0.5,
-            kernel_type: "rbf".to_string(),
+            kernel_type: "matern52".to_string(),
             target_moisture: 15.0,
             confidence_level: 0.95,
             max_prediction_hours: 5000.0,
@@ -281,30 +281,35 @@ impl GaussianProcessRegressor {
 
     pub fn optimize_hyperparameters(&mut self, x: &[f64], y: &[f64]) -> Result<(), &'static str> {
         let mut best_lml = f64::NEG_INFINITY;
-        let mut best_params = (self.config.length_scale, self.config.signal_variance, self.config.noise_variance);
+        let mut best_params = (self.config.length_scale, self.config.signal_variance, self.config.noise_variance, self.config.kernel_type.clone());
 
         let length_scales = vec![10.0, 50.0, 100.0, 200.0, 500.0];
         let sigmas = vec![10.0, 25.0, 50.0, 100.0];
         let noises = vec![0.1, 0.5, 1.0, 2.0];
+        let kernels = vec!["matern52", "matern32", "rbf"];
 
-        for &ls in &length_scales {
-            for &sv in &sigmas {
-                for &nv in &noises {
-                    self.config.length_scale = ls;
-                    self.config.signal_variance = sv;
-                    self.config.noise_variance = nv;
+        for &kernel in &kernels {
+            for &ls in &length_scales {
+                for &sv in &sigmas {
+                    for &nv in &noises {
+                        self.config.kernel_type = kernel.to_string();
+                        self.config.length_scale = ls;
+                        self.config.signal_variance = sv;
+                        self.config.noise_variance = nv;
 
-                    if self.fit(x, y).is_ok() {
-                        let lml = self.calculate_log_marginal_likelihood();
-                        if lml > best_lml {
-                            best_lml = lml;
-                            best_params = (ls, sv, nv);
+                        if self.fit(x, y).is_ok() {
+                            let lml = self.calculate_log_marginal_likelihood();
+                            if lml > best_lml {
+                                best_lml = lml;
+                                best_params = (ls, sv, nv, kernel.to_string());
+                            }
                         }
                     }
                 }
             }
         }
 
+        self.config.kernel_type = best_params.3;
         self.config.length_scale = best_params.0;
         self.config.signal_variance = best_params.1;
         self.config.noise_variance = best_params.2;
@@ -723,5 +728,32 @@ mod tests {
             assert!(interval_width > 0.0,
                     "Interval width should be positive for confidence level {}", level);
         }
+    }
+
+    #[test]
+    fn test_matern_default_kernel_and_optimization() {
+        let config = GPRConfig::default();
+        assert_eq!(config.kernel_type, "matern52",
+                   "Default kernel should be Matern 5/2");
+
+        let mut gpr = GaussianProcessRegressor::new(config);
+
+        let x = vec![0.0, 30.0, 60.0, 100.0, 150.0, 200.0];
+        let y = vec![78.0, 65.0, 53.0, 40.0, 30.0, 24.0];
+
+        gpr.fit(&x, &y).unwrap();
+        let result_matern = gpr.predict_endpoint().unwrap();
+        assert!(result_matern.predicted_end_time_hours > 0.0);
+
+        gpr.optimize_hyperparameters(&x, &y).unwrap();
+        assert!(gpr.config.kernel_type == "matern52"
+                || gpr.config.kernel_type == "matern32"
+                || gpr.config.kernel_type == "rbf",
+                "Optimized kernel should be one of the valid types, got {}", gpr.config.kernel_type);
+
+        let result_optimized = gpr.predict_endpoint().unwrap();
+        assert!(result_optimized.log_marginal_likelihood.is_finite());
+        assert!(result_optimized.r_squared > 0.5,
+                "R-squared should be reasonable after optimization");
     }
 }
