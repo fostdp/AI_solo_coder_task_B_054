@@ -87,6 +87,51 @@ impl ConvectionDiffusionSolver {
         (v * l_char) / d_eff
     }
 
+    fn van_leer_limiter(r: f64) -> f64 {
+        if r <= 0.0 {
+            0.0
+        } else {
+            2.0 * r / (1.0 + r)
+        }
+    }
+
+    fn tvd_flux_contribution(&self, velocity: f64, c_m2: f64, c_m1: f64, c_0: f64, c_p1: f64, c_p2: f64, delta: f64) -> f64 {
+        let eps = 1e-15;
+        if velocity > 0.0 {
+            let r_plus = if (c_p1 - c_0).abs() > eps {
+                (c_0 - c_m1) / (c_p1 - c_0)
+            } else {
+                1.0
+            };
+            let r_minus = if (c_0 - c_m1).abs() > eps {
+                (c_m1 - c_m2) / (c_0 - c_m1)
+            } else {
+                1.0
+            };
+            let phi_plus = Self::van_leer_limiter(r_plus);
+            let phi_minus = Self::van_leer_limiter(r_minus);
+            let flux_plus = velocity * c_0 + 0.5 * velocity * phi_plus * (c_p1 - c_0);
+            let flux_minus = velocity * c_m1 + 0.5 * velocity * phi_minus * (c_0 - c_m1);
+            (flux_plus - flux_minus) / delta
+        } else {
+            let r_plus = if (c_0 - c_p1).abs() > eps {
+                (c_p1 - c_p2) / (c_0 - c_p1)
+            } else {
+                1.0
+            };
+            let r_minus = if (c_m1 - c_0).abs() > eps {
+                (c_0 - c_p1) / (c_m1 - c_0)
+            } else {
+                1.0
+            };
+            let phi_plus = Self::van_leer_limiter(r_plus);
+            let phi_minus = Self::van_leer_limiter(r_minus);
+            let flux_plus = velocity * c_p1 + 0.5 * velocity * phi_plus * (c_0 - c_p1);
+            let flux_minus = velocity * c_0 + 0.5 * velocity * phi_minus * (c_m1 - c_0);
+            (flux_plus - flux_minus) / delta
+        }
+    }
+
     pub fn solve(&self) -> ConcentrationFieldResult {
         let nx = self.config.num_grid_x;
         let ny = self.config.num_grid_y;
@@ -107,9 +152,13 @@ impl ConvectionDiffusionSolver {
 
         let r_x = d_x * dt / (dx * dx);
         let r_y = d_y * dt / (dy * dy);
-        let _pe_cell_y = (v_y * dy) / d_y;
+        let cfl_x = v_x.abs() * dt / dx;
+        let cfl_y = v_y.abs() * dt / dy;
 
         assert!(r_x < 0.5 && r_y < 0.5, "FTCS stability condition violated");
+
+        let use_tvd_x = cfl_x <= 1.0;
+        let use_tvd_y = cfl_y <= 1.0;
 
         let mut grid_x = vec![0.0; nx];
         let mut grid_y = vec![0.0; ny];
@@ -153,15 +202,29 @@ impl ConvectionDiffusionSolver {
                     let diffusion_term = d_x * (c_right - 2.0 * c + c_left) / (dx * dx)
                         + d_y * (c_up - 2.0 * c + c_down) / (dy * dy);
 
-                    let convection_x = if v_x >= 0.0 {
-                        v_x * (c - c_left) / dx
+                    let c_left2 = if i >= 2 { concentration[j][i - 2] } else { c_left };
+                    let c_right2 = if i < nx - 2 { concentration[j][i + 2] } else { c_right };
+                    let c_down2 = if j >= 2 { concentration[j - 2][i] } else { c_down };
+                    let c_up2 = if j < ny - 2 { concentration[j + 2][i] } else { c_up };
+
+                    let convection_x = if v_x.abs() > 1e-15 {
+                        if use_tvd_x {
+                            self.tvd_flux_contribution(v_x, c_left2, c_left, c, c_right, c_right2, dx)
+                        } else {
+                            if v_x >= 0.0 { v_x * (c - c_left) / dx } else { v_x * (c_right - c) / dx }
+                        }
                     } else {
-                        v_x * (c_right - c) / dx
+                        0.0
                     };
-                    let convection_y = if v_y >= 0.0 {
-                        v_y * (c - c_down) / dy
+
+                    let convection_y = if v_y.abs() > 1e-15 {
+                        if use_tvd_y {
+                            self.tvd_flux_contribution(v_y, c_down2, c_down, c, c_up, c_up2, dy)
+                        } else {
+                            if v_y >= 0.0 { v_y * (c - c_down) / dy } else { v_y * (c_up - c) / dy }
+                        }
                     } else {
-                        v_y * (c_up - c) / dy
+                        0.0
                     };
 
                     let dc_dt = diffusion_term - convection_x - convection_y;
@@ -536,5 +599,53 @@ mod tests {
         let final_depth = result.penetration_depth_values.last().copied().unwrap_or(0.0);
         assert!(final_depth > 0.001,
                 "Advection-dominated flow should penetrate significantly");
+    }
+
+    #[test]
+    fn test_tvd_sharp_front_preservation() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 20,
+            num_grid_y: 40,
+            total_time_hours: 24.0,
+            time_steps: 500,
+            thickness: 0.03,
+            surface_concentration: 0.5,
+            diffusion_coefficient: 5e-11,
+            permeability: 5e-16,
+            ..Default::default()
+        };
+        let solver = ConvectionDiffusionSolver::new(config.clone());
+        let result = solver.solve();
+
+        let centerline = &result.concentration_profile_centerline;
+        let ny = centerline.len();
+        if ny >= 3 {
+            let mut max_oscillation: f64 = 0.0;
+            for j in 1..(ny - 1) {
+                let oscillation = centerline[j] - 0.5 * (centerline[j - 1] + centerline[j + 1]);
+                max_oscillation = max_oscillation.max(oscillation.abs());
+            }
+            let avg_conc: f64 = centerline.iter().sum::<f64>() / ny as f64;
+            let relative_osc = max_oscillation / (avg_conc + 1e-10);
+            assert!(relative_osc < 0.5,
+                    "TVD scheme should suppress spurious oscillations (relative={:.4})", relative_osc);
+        }
+
+        assert!(result.max_concentration <= config.surface_concentration * 1.1);
+        assert!(result.avg_concentration >= 0.0);
+    }
+
+    #[test]
+    fn test_van_leer_limiter_properties() {
+        assert!((ConvectionDiffusionSolver::van_leer_limiter(0.0) - 0.0).abs() < 1e-10,
+                "Limiter should be 0 for r=0");
+        assert!((ConvectionDiffusionSolver::van_leer_limiter(1.0) - 1.0).abs() < 1e-10,
+                "Limiter should be 1 for r=1");
+        assert!(ConvectionDiffusionSolver::van_leer_limiter(0.5) > 0.0,
+                "Limiter should be positive for r>0");
+        assert!(ConvectionDiffusionSolver::van_leer_limiter(2.0) < 2.0,
+                "Limiter should satisfy TVD upper bound");
+        assert!(ConvectionDiffusionSolver::van_leer_limiter(-1.0) == 0.0,
+                "Limiter should be 0 for negative r");
     }
 }
