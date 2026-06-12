@@ -471,4 +471,206 @@ mod tests {
         assert!((sim.s_curve(0.0) - 0.119).abs() < 0.01);
         assert!((sim.s_curve(1.0) - 0.881).abs() < 0.01);
     }
+
+    #[test]
+    fn test_size_change_below_05_percent_is_stable() {
+        let config = DimensionalStabilityConfig {
+            agent_concentration: 40.0,
+            num_cycles: 5,
+            steps_per_cycle: 15,
+            hygro_expansion_coeff: 0.003,
+            initial_moisture: 12.0,
+            high_moisture: 18.0,
+            ..Default::default()
+        };
+        let sim = DimensionalStabilitySimulator::new(config);
+        let result = sim.simulate();
+
+        for (i, summary) in result.cycle_summaries.iter().enumerate() {
+            let max_change_pct = summary.dimensional_swing_percent.abs();
+            if max_change_pct < 0.5 {
+                assert!(result.stability_score >= 70.0,
+                        "Cycle {}: change {:.3}% < 0.5% should be stable (score={:.1})",
+                        i, max_change_pct, result.stability_score);
+            }
+        }
+
+        let avg_change_pct = result.cycle_summaries.iter()
+            .map(|s| s.dimensional_swing_percent.abs())
+            .sum::<f64>() / result.cycle_summaries.len() as f64;
+
+        if avg_change_pct < 0.5 {
+            let good_ratings = ["excellent", "good"];
+            assert!(good_ratings.contains(&result.stability_rating.as_str()),
+                    "Avg change {:.3}% < 0.5% should have good rating (got {})",
+                    avg_change_pct, result.stability_rating);
+        }
+    }
+
+    #[test]
+    fn test_reinforcement_improves_stability() {
+        let base_config = DimensionalStabilityConfig {
+            num_cycles: 5,
+            steps_per_cycle: 10,
+            ..Default::default()
+        };
+
+        let config_unreinforced = DimensionalStabilityConfig {
+            agent_concentration: 0.0,
+            ..base_config.clone()
+        };
+
+        let config_reinforced = DimensionalStabilityConfig {
+            agent_concentration: 50.0,
+            ..base_config.clone()
+        };
+
+        let sim_unreinforced = DimensionalStabilitySimulator::new(config_unreinforced);
+        let sim_reinforced = DimensionalStabilitySimulator::new(config_reinforced);
+
+        let result_unreinforced = sim_unreinforced.simulate();
+        let result_reinforced = sim_reinforced.simulate();
+
+        assert!(result_reinforced.improvement_factor > 1.0,
+                "Reinforcement factor should be > 1.0 (got {:.2})",
+                result_reinforced.improvement_factor);
+
+        let unreinforced_change = result_unreinforced.cycle_summaries.last().unwrap().dimensional_swing_percent.abs();
+        let reinforced_change = result_reinforced.cycle_summaries.last().unwrap().dimensional_swing_percent.abs();
+
+        assert!(reinforced_change < unreinforced_change * 0.95,
+                "Reinforced max change ({:.4}) should be less than unreinforced ({:.4})",
+                reinforced_change, unreinforced_change);
+
+        assert!(result_reinforced.stability_score > result_unreinforced.stability_score,
+                "Reinforced stability score ({:.1}) should be higher than unreinforced ({:.1})",
+                result_reinforced.stability_score, result_unreinforced.stability_score);
+    }
+
+    #[test]
+    fn test_extreme_humidity_cycle_boundary() {
+        let config = DimensionalStabilityConfig {
+            num_cycles: 3,
+            steps_per_cycle: 20,
+            initial_moisture: 8.0,
+            high_moisture: 28.0,
+            low_moisture: 6.0,
+            hygro_expansion_coeff: 0.005,
+            ..Default::default()
+        };
+        let sim = DimensionalStabilitySimulator::new(config);
+        let result = sim.simulate();
+
+        for summary in &result.cycle_summaries {
+            assert!(summary.dimensional_swing_percent.abs() > 0.0);
+            assert!(summary.residual_deformation_percent.is_finite());
+        }
+
+        assert!(result.long_term_prediction_50yr.is_finite());
+    }
+
+    #[test]
+    fn test_zero_cycles_anomaly() {
+        let config = DimensionalStabilityConfig {
+            num_cycles: 0,
+            steps_per_cycle: 10,
+            ..Default::default()
+        };
+        let sim = DimensionalStabilitySimulator::new(config);
+        let result = sim.simulate();
+
+        assert!(result.cycle_summaries.is_empty());
+        assert_eq!(result.time_series.len(), 0);
+        assert!(result.stability_score >= 0.0);
+    }
+
+    #[test]
+    fn test_single_cycle_boundary() {
+        let config = DimensionalStabilityConfig {
+            num_cycles: 1,
+            steps_per_cycle: 10,
+            ..Default::default()
+        };
+        let sim = DimensionalStabilitySimulator::new(config);
+        let result = sim.simulate();
+
+        assert_eq!(result.cycle_summaries.len(), 1);
+        assert_eq!(result.time_series.len(), 10);
+        assert!(result.cycle_summaries[0].dimensional_swing_percent.is_finite());
+    }
+
+    #[test]
+    fn test_agent_concentration_saturation() {
+        let base_config = DimensionalStabilityConfig {
+            num_cycles: 3,
+            steps_per_cycle: 10,
+            ..Default::default()
+        };
+
+        let config_30 = DimensionalStabilityConfig {
+            agent_concentration: 30.0,
+            ..base_config.clone()
+        };
+
+        let config_70 = DimensionalStabilityConfig {
+            agent_concentration: 70.0,
+            ..base_config.clone()
+        };
+
+        let sim_30 = DimensionalStabilitySimulator::new(config_30);
+        let sim_70 = DimensionalStabilitySimulator::new(config_70);
+
+        let result_30 = sim_30.simulate();
+        let result_70 = sim_70.simulate();
+
+        assert!(result_70.stability_score >= result_30.stability_score * 0.95,
+                "Higher agent concentration should not reduce stability significantly");
+        assert!(result_70.improvement_factor >= result_30.improvement_factor * 0.95);
+    }
+
+    #[test]
+    fn test_dimensional_change_consistency() {
+        let config = DimensionalStabilityConfig {
+            num_cycles: 4,
+            steps_per_cycle: 20,
+            agent_concentration: 35.0,
+            ..Default::default()
+        };
+        let low_m = config.low_moisture;
+        let high_m = config.high_moisture;
+        let shrinkage_coeff = config.shrinkage_coeff;
+        let sim = DimensionalStabilitySimulator::new(config);
+        let result = sim.simulate();
+
+        let void_filling = sim.calculate_void_filling();
+        let effective_shrinkage = sim.effective_shrinkage_coeff(void_filling);
+
+        assert!(effective_shrinkage <= shrinkage_coeff,
+                "Effective shrinkage should be <= raw coefficient");
+        assert!(effective_shrinkage >= 0.0);
+
+        for dp in &result.time_series {
+            assert!(dp.dimensional_change_percent.is_finite());
+            assert!(dp.moisture >= low_m - 1.0);
+            assert!(dp.moisture <= high_m + 1.0);
+        }
+    }
+
+    #[test]
+    fn test_long_term_prediction_monotonic() {
+        let config = DimensionalStabilityConfig {
+            num_cycles: 8,
+            steps_per_cycle: 8,
+            ..Default::default()
+        };
+        let sim = DimensionalStabilitySimulator::new(config);
+        let result = sim.simulate();
+
+        assert!(result.long_term_prediction_10yr.is_finite());
+        assert!(result.long_term_prediction_50yr.is_finite());
+        assert!(result.long_term_prediction_50yr.abs() >= result.long_term_prediction_10yr.abs() * 0.9,
+                "50yr prediction should show at least as much change as 10yr (10yr={:.4}%, 50yr={:.4}%)",
+                result.long_term_prediction_10yr,
+                result.long_term_prediction_50yr);
+    }
 }
