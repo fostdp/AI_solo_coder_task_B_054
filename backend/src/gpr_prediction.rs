@@ -558,4 +558,170 @@ mod tests {
         let z50 = normal_quantile(0.5);
         assert!(z50.abs() < 1e-6);
     }
+
+    #[test]
+    fn test_prediction_interval_covers_true_endpoint() {
+        let config = GPRConfig {
+            length_scale: 80.0,
+            signal_variance: 150.0,
+            noise_variance: 0.05,
+            target_moisture: 15.0,
+            confidence_level: 0.95,
+            max_prediction_hours: 2000.0,
+            ..Default::default()
+        };
+        let mut gpr = GaussianProcessRegressor::new(config);
+
+        let true_endpoint_hours = 450.0;
+        let decay_rate = (75.0 - 15.0) / true_endpoint_hours;
+
+        let x_train: Vec<f64> = (0..8).map(|i| i as f64 * 40.0).collect();
+        let y_train: Vec<f64> = x_train.iter()
+            .map(|&t| 15.0 + (75.0 - 15.0) * (-decay_rate * t / 60.0).exp())
+            .collect();
+
+        gpr.fit(&x_train, &y_train).unwrap();
+        let result = gpr.predict_endpoint().unwrap();
+
+        assert!(result.confidence_lower_hours <= true_endpoint_hours,
+                "Lower bound {:.1} should be <= true endpoint {:.1}",
+                result.confidence_lower_hours, true_endpoint_hours);
+        assert!(result.confidence_upper_hours >= true_endpoint_hours,
+                "Upper bound {:.1} should be >= true endpoint {:.1}",
+                result.confidence_upper_hours, true_endpoint_hours);
+        assert!(result.remaining_hours > 0.0);
+    }
+
+    #[test]
+    fn test_multiple_kernel_functions() {
+        let kernels = ["rbf", "matern32", "matern52"];
+
+        let x = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let y = vec![80.0, 72.0, 65.0, 58.0, 52.0];
+        let x_test = vec![50.0];
+
+        for kernel in &kernels {
+            let config = GPRConfig {
+                kernel_type: kernel.to_string(),
+                length_scale: 100.0,
+                signal_variance: 100.0,
+                noise_variance: 0.1,
+                ..Default::default()
+            };
+            let mut gpr = GaussianProcessRegressor::new(config);
+            assert!(gpr.fit(&x, &y).is_ok(), "Fit should succeed for {}", kernel);
+
+            let (mean, var) = gpr.predict(&x_test).unwrap();
+            assert!(mean[0].is_finite(), "Mean should be finite for {}", kernel);
+            assert!(var[0] >= 0.0, "Variance should be non-negative for {}", kernel);
+        }
+    }
+
+    #[test]
+    fn test_minimal_training_data_boundary() {
+        let config = GPRConfig::default();
+        let mut gpr = GaussianProcessRegressor::new(config);
+
+        let x = vec![0.0, 48.0];
+        let y = vec![80.0, 60.0];
+
+        assert!(gpr.fit(&x, &y).is_ok());
+        let (mean, _) = gpr.predict(&[24.0]).unwrap();
+        assert!((mean[0] - 70.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn test_already_at_target_anomaly() {
+        let config = GPRConfig {
+            target_moisture: 15.0,
+            ..Default::default()
+        };
+        let mut gpr = GaussianProcessRegressor::new(config);
+
+        let x = vec![0.0, 24.0, 48.0, 72.0];
+        let y = vec![18.0, 16.0, 14.0, 12.0];
+
+        gpr.fit(&x, &y).unwrap();
+        let result = gpr.predict_endpoint().unwrap();
+
+        assert!(result.predicted_end_time_hours > 0.0);
+        assert!(result.predicted_end_time_hours < *x.last().unwrap() + 100.0,
+                "If crossing happened near or before the last data point, endpoint should be reasonable");
+    }
+
+    #[test]
+    fn test_non_monotonic_data_boundary() {
+        let config = GPRConfig {
+            target_moisture: 15.0,
+            noise_variance: 1.0,
+            ..Default::default()
+        };
+        let mut gpr = GaussianProcessRegressor::new(config);
+
+        let x = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let y = vec![80.0, 75.0, 78.0, 65.0, 55.0];
+
+        assert!(gpr.fit(&x, &y).is_ok(), "Should handle non-monotonic noisy data");
+
+        let result = gpr.predict_endpoint();
+        assert!(result.is_ok(), "Endpoint prediction should not crash with noisy data");
+    }
+
+    #[test]
+    fn test_extrapolation_far_future() {
+        let config = GPRConfig {
+            target_moisture: 15.0,
+            max_prediction_hours: 5000.0,
+            length_scale: 200.0,
+            ..Default::default()
+        };
+        let max_hours = config.max_prediction_hours;
+        let mut gpr = GaussianProcessRegressor::new(config);
+
+        let x = vec![0.0, 50.0, 100.0];
+        let y = vec![75.0, 70.0, 66.0];
+
+        gpr.fit(&x, &y).unwrap();
+        let result = gpr.predict_endpoint().unwrap();
+
+        assert!(result.predicted_end_time_hours > *x.last().unwrap());
+        assert!(result.predicted_end_time_hours <= max_hours);
+        assert!(result.confidence_upper_hours > result.confidence_lower_hours);
+    }
+
+    #[test]
+    fn test_inconsistent_input_lengths() {
+        let mut gpr = GaussianProcessRegressor::new(GPRConfig::default());
+
+        let x = vec![0.0, 24.0, 48.0];
+        let y = vec![80.0, 70.0];
+
+        let result = gpr.fit(&x, &y);
+        assert!(result.is_err(), "Should fail with inconsistent input lengths");
+    }
+
+    #[test]
+    fn test_confidence_level_boundary() {
+        for &level in &[0.5, 0.9, 0.95, 0.99] {
+            let config = GPRConfig {
+                confidence_level: level,
+                target_moisture: 15.0,
+                length_scale: 100.0,
+                signal_variance: 100.0,
+                noise_variance: 0.1,
+                ..Default::default()
+            };
+            let mut gpr = GaussianProcessRegressor::new(config);
+
+            let x = vec![0.0, 50.0, 100.0, 150.0];
+            let y = vec![75.0, 65.0, 55.0, 45.0];
+
+            gpr.fit(&x, &y).unwrap();
+            let result = gpr.predict_endpoint().unwrap();
+
+            let interval_width = result.confidence_upper_hours - result.confidence_lower_hours;
+            assert!(interval_width > 0.0,
+                    "Interval width should be positive for confidence level {}", level);
+        }
+    }
 }
