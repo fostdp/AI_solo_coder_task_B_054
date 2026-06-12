@@ -68,6 +68,25 @@ impl DehydrationStressSolver {
     }
 
     pub fn compute_stress_field(&self, moisture_profile: &[Vec<f64>]) -> StressResult {
+        if moisture_profile.is_empty() || moisture_profile[0].is_empty() {
+            return StressResult {
+                node_x: Vec::new(),
+                node_y: Vec::new(),
+                sigma_x: Vec::new(),
+                sigma_y: Vec::new(),
+                sigma_von_mises: Vec::new(),
+                max_principal: Vec::new(),
+                min_principal: Vec::new(),
+                stress_gradient_x: Vec::new(),
+                stress_gradient_y: Vec::new(),
+                danger_zones: Vec::new(),
+                max_von_mises: 0.0,
+                safety_factor: 0.0,
+                avg_sigma_x: 0.0,
+                avg_sigma_y: 0.0,
+            };
+        }
+
         let nx = self.config.num_elements_x + 1;
         let ny = self.config.num_elements_y + 1;
         let total_nodes = nx * ny;
@@ -368,5 +387,170 @@ mod tests {
 
         assert!(r_long.max_von_mises > r_short.max_von_mises * 0.5,
                 "Longer dehydration should create significant stress");
+    }
+
+    #[test]
+    fn test_high_gradient_region_has_max_stress() {
+        let config = StressConfig {
+            num_elements_x: 20,
+            num_elements_y: 20,
+            width: 0.1,
+            height: 0.1,
+            ..Default::default()
+        };
+        let nx = config.num_elements_x + 1;
+        let ny = config.num_elements_y + 1;
+        let solver = DehydrationStressSolver::new(config);
+
+        let mut moisture = vec![vec![50.0; nx]; ny];
+        let center_i = nx / 2;
+        let center_j = ny / 2;
+
+        for j in 0..ny {
+            for i in 0..nx {
+                let x = i as f64 / (nx - 1) as f64;
+                let y = j as f64 / (ny - 1) as f64;
+                let dist_from_center = ((x - 0.5).powi(2) + (y - 0.5).powi(2)).sqrt();
+
+                if dist_from_center < 0.3 {
+                    moisture[j][i] = 70.0;
+                } else if dist_from_center < 0.32 {
+                    let t = (dist_from_center - 0.3) / 0.02;
+                    moisture[j][i] = 70.0 - t * 50.0;
+                } else if dist_from_center < 0.45 {
+                    moisture[j][i] = 20.0;
+                } else {
+                    let t = (dist_from_center - 0.45) / 0.25;
+                    moisture[j][i] = 20.0 + t * 15.0;
+                }
+            }
+        }
+
+        moisture[center_j][center_i] = 70.0;
+
+        let result = solver.compute_stress_field(&moisture);
+
+        let mut max_stress = 0.0;
+        let mut max_stress_idx = 0;
+        for (idx, &s) in result.sigma_von_mises.iter().enumerate() {
+            if s > max_stress {
+                max_stress = s;
+                max_stress_idx = idx;
+            }
+        }
+
+        let max_i = max_stress_idx % nx;
+        let max_j = max_stress_idx / nx;
+        let max_x = max_i as f64 / (nx - 1) as f64;
+        let max_y = max_j as f64 / (ny - 1) as f64;
+        let dist_from_center = ((max_x - 0.5).powi(2) + (max_y - 0.5).powi(2)).sqrt();
+
+        assert!(max_stress > 1e6, "Max stress should be significant (got {:.2e})", max_stress);
+
+        let mut gradient: Vec<f64> = vec![0.0; nx * ny];
+        for j in 1..(ny - 1) {
+            for i in 1..(nx - 1) {
+                let dm_dx = (moisture[j][i + 1] - moisture[j][i - 1]) / 2.0;
+                let dm_dy = (moisture[j + 1][i] - moisture[j - 1][i]) / 2.0;
+                gradient[j * nx + i] = (dm_dx * dm_dx + dm_dy * dm_dy).sqrt();
+            }
+        }
+
+        let mut max_grad = 0.0;
+        let mut max_grad_idx = 0;
+        for (idx, &g) in gradient.iter().enumerate() {
+            if g > max_grad {
+                max_grad = g;
+                max_grad_idx = idx;
+            }
+        }
+
+        let grad_i = max_grad_idx % nx;
+        let grad_j = max_grad_idx / nx;
+        let grad_x = grad_i as f64 / (nx - 1) as f64;
+        let grad_y = grad_j as f64 / (ny - 1) as f64;
+        let grad_dist = ((grad_x - 0.5).powi(2) + (grad_y - 0.5).powi(2)).sqrt();
+
+        assert!(grad_dist >= 0.28 && grad_dist <= 0.35,
+                "Max gradient should be in transition zone (dist={:.3})", grad_dist);
+
+        assert!(dist_from_center >= 0.25 && dist_from_center <= 0.5,
+                "Max stress should occur in or near high gradient region (dist={:.3}, stress={:.2e})",
+                dist_from_center, max_stress);
+    }
+
+    #[test]
+    fn test_boundary_zero_moisture_gradient() {
+        let config = StressConfig {
+            num_elements_x: 10,
+            num_elements_y: 10,
+            ..Default::default()
+        };
+        let solver = DehydrationStressSolver::new(config);
+
+        let mut moisture = vec![vec![50.0; 11]; 11];
+        for i in 0..11 {
+            moisture[0][i] = 10.0;
+            moisture[10][i] = 10.0;
+            moisture[i][0] = 10.0;
+            moisture[i][10] = 10.0;
+        }
+
+        let result = solver.compute_stress_field(&moisture);
+        assert!(result.max_von_mises > 1e6, "Boundary gradient should produce stress");
+        assert!(result.safety_factor > 0.0);
+    }
+
+    #[test]
+    fn test_extreme_tensile_strength_boundary() {
+        let config_weak = StressConfig {
+            tensile_strength: 1.0e6,
+            ..Default::default()
+        };
+        let solver_weak = DehydrationStressSolver::new(config_weak);
+
+        let config_strong = StressConfig {
+            tensile_strength: 100.0e6,
+            ..Default::default()
+        };
+        let solver_strong = DehydrationStressSolver::new(config_strong);
+
+        let moisture = solver_weak.generate_moisture_profile(80.0, 12.0, 50.0, 1e-9);
+
+        let r_weak = solver_weak.compute_stress_field(&moisture);
+        let r_strong = solver_strong.compute_stress_field(&moisture);
+
+        assert!(r_weak.safety_factor < r_strong.safety_factor,
+                "Weaker material should have lower safety factor");
+        assert!(r_weak.danger_zones.len() >= r_strong.danger_zones.len(),
+                "Weaker material should have more danger zones");
+    }
+
+    #[test]
+    fn test_empty_moisture_anomaly() {
+        let config = StressConfig::default();
+        let solver = DehydrationStressSolver::new(config);
+
+        let empty: Vec<Vec<f64>> = Vec::new();
+        let result = solver.compute_stress_field(&empty);
+        assert_eq!(result.sigma_x.len(), 0);
+        assert_eq!(result.max_von_mises, 0.0);
+        assert!(result.danger_zones.is_empty());
+    }
+
+    #[test]
+    fn test_single_element_boundary() {
+        let config = StressConfig {
+            num_elements_x: 1,
+            num_elements_y: 1,
+            ..Default::default()
+        };
+        let solver = DehydrationStressSolver::new(config);
+
+        let moisture = vec![vec![80.0, 70.0], vec![75.0, 65.0]];
+        let result = solver.compute_stress_field(&moisture);
+
+        assert_eq!(result.sigma_x.len(), 4);
+        assert!(result.max_von_mises > 0.0);
     }
 }
