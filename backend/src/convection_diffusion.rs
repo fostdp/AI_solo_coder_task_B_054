@@ -386,4 +386,155 @@ mod tests {
         assert!(pe.is_finite());
         assert!(pe > 0.0);
     }
+
+    #[test]
+    fn test_peg_front_vs_mri_measurement() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 30,
+            num_grid_y: 60,
+            total_time_hours: 160.0,
+            time_steps: 700,
+            thickness: 0.05,
+            surface_concentration: 0.4,
+            diffusion_coefficient: 1.8e-10,
+            porosity: 0.45,
+            tortuosity: 2.5,
+            permeability: 1.5e-16,
+            pressure_gradient: 120000.0,
+            ..Default::default()
+        };
+        let _dy = config.thickness / (config.num_grid_y - 1) as f64;
+        let solver = ConvectionDiffusionSolver::new(config.clone());
+        let result = solver.solve();
+
+        let mri_measured_depth_mm = 12.5;
+        let predicted_depth_mm = result.penetration_depth_values.last().copied().unwrap_or(0.0) * 1000.0;
+        let error_mm = (predicted_depth_mm - mri_measured_depth_mm).abs();
+
+        assert!(error_mm < 2.0,
+                "PEG front prediction error ({:.2} mm) should be < 2 mm (predicted={:.2} mm, MRI={:.2} mm)",
+                error_mm, predicted_depth_mm, mri_measured_depth_mm);
+        assert!(result.penetration_depth_time.len() >= 2);
+    }
+
+    #[test]
+    fn test_analytical_vs_numerical_penetration() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 20,
+            num_grid_y: 50,
+            total_time_hours: 24.0,
+            time_steps: 500,
+            thickness: 0.02,
+            diffusion_coefficient: 5e-11,
+            permeability: 1e-18,
+            ..Default::default()
+        };
+        let solver = ConvectionDiffusionSolver::new(config.clone());
+        let result = solver.solve();
+
+        let d_eff = solver.effective_diffusion();
+        let t_sec = config.total_time_hours * 3600.0;
+        let analytical_depth_m = 2.0 * (d_eff * t_sec).sqrt();
+        let analytical_depth_mm = analytical_depth_m * 1000.0;
+        let numerical_depth_mm = result.penetration_depth_values.last().copied().unwrap_or(0.0) * 1000.0;
+
+        let error_mm = (analytical_depth_mm - numerical_depth_mm).abs();
+        assert!(error_mm < 2.0,
+                "Numerical vs analytical penetration error ({:.2} mm) < 2 mm (analytical={:.2}, numerical={:.2})",
+                error_mm, analytical_depth_mm, numerical_depth_mm);
+    }
+
+    #[test]
+    fn test_concentration_conservation_boundary() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 10,
+            num_grid_y: 20,
+            total_time_hours: 1.0,
+            time_steps: 10,
+            surface_concentration: 0.5,
+            ..Default::default()
+        };
+        let _dy = config.thickness / (config.num_grid_y - 1) as f64;
+        let solver = ConvectionDiffusionSolver::new(config.clone());
+        let result = solver.solve();
+
+        for row in &result.concentration {
+            for &c in row {
+                assert!(c >= -1e-9 && c <= config.surface_concentration * 1.01,
+                        "Concentration {:.4} out of bounds [0, {:.2}]", c, config.surface_concentration);
+            }
+        }
+
+        for i in 0..config.num_grid_x {
+            assert!((result.concentration[0][i] - config.surface_concentration).abs() < 0.01,
+                    "Surface concentration should be maintained");
+        }
+    }
+
+    #[test]
+    fn test_zero_diffusion_anomaly() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 10,
+            num_grid_y: 10,
+            total_time_hours: 100.0,
+            time_steps: 50,
+            diffusion_coefficient: 0.0,
+            permeability: 0.0,
+            surface_concentration: 0.5,
+            ..Default::default()
+        };
+        let solver = ConvectionDiffusionSolver::new(config.clone());
+        let result = solver.solve();
+
+        for j in 1..config.num_grid_y {
+            for i in 0..config.num_grid_x {
+                assert!(result.concentration[j][i].abs() < 1e-9,
+                        "With zero transport, interior should remain zero");
+            }
+        }
+        let final_depth = result.penetration_depth_values.last().copied().unwrap_or(0.0);
+        assert!(final_depth < 0.001,
+                "Penetration depth should be near zero with no transport");
+    }
+
+    #[test]
+    fn test_single_grid_boundary() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 2,
+            num_grid_y: 2,
+            total_time_hours: 1.0,
+            time_steps: 1,
+            ..Default::default()
+        };
+        let solver = ConvectionDiffusionSolver::new(config);
+        let result = solver.solve();
+
+        assert_eq!(result.concentration.len(), 2);
+        assert_eq!(result.concentration[0].len(), 2);
+        let final_depth = result.penetration_depth_values.last().copied().unwrap_or(0.0);
+        assert!(final_depth >= 0.0);
+    }
+
+    #[test]
+    fn test_high_peclet_regime() {
+        let config = ConvectionDiffusionConfig {
+            num_grid_x: 15,
+            num_grid_y: 25,
+            total_time_hours: 48.0,
+            time_steps: 200,
+            permeability: 1e-12,
+            viscosity: 0.001,
+            diffusion_coefficient: 1e-12,
+            ..Default::default()
+        };
+        let solver = ConvectionDiffusionSolver::new(config.clone());
+
+        let pe = solver.peclet_number();
+        assert!(pe > 10.0, "High Pe regime should have Pe > 10 (got {:.1})", pe);
+
+        let result = solver.solve();
+        let final_depth = result.penetration_depth_values.last().copied().unwrap_or(0.0);
+        assert!(final_depth > 0.001,
+                "Advection-dominated flow should penetrate significantly");
+    }
 }
